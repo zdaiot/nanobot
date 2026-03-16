@@ -402,6 +402,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     # === Local deployment (matched by config key, NOT by api_base) =========
     # vLLM / any OpenAI-compatible local server.
     # Detected when config key is "vllm" (provider_name="vllm").
+    # 使用nanobot/providers/litellm_provider.py，hosted_vllm前缀用于告诉 LiteLLM "用哪个后端"，转发时会去掉。
     ProviderSpec(
         name="vllm",
         keywords=("vllm",),

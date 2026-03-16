@@ -29,6 +29,7 @@ class SpawnTool(Tool):
 
     @property
     def description(self) -> str:
+        # 只有任务耗时长、且不需要等结果时，调用
         return (
             "Spawn a subagent to handle a task in the background. "
             "Use this for complex or time-consuming tasks that can run independently. "

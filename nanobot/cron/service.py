@@ -19,28 +19,47 @@ def _now_ms() -> int:
 
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
     """Compute next run time in ms."""
+    """根据调度规则计算下一次执行时间（毫秒时间戳）。
+
+    Args:
+        schedule: 调度配置，支持三种模式（at / every / cron）。
+        now_ms:   当前时间的毫秒时间戳，作为计算基准。
+
+    Returns:
+        下一次应执行的毫秒时间戳；若无法计算（已过期、配置非法等）则返回 None。
+    """
+    # ── 模式一：at（一次性定时）──────────────────────────────────────────
+    # 仅在 at_ms 存在且尚未过期时返回该时间点，否则返回 None（表示不再执行）
     if schedule.kind == "at":
         return schedule.at_ms if schedule.at_ms and schedule.at_ms > now_ms else None
 
+    # ── 模式二：every（固定间隔循环）────────────────────────────────────
+    # 每次执行后，下一次 = 当前时间 + 间隔，保证间隔从"现在"起算，不会漂移
     if schedule.kind == "every":
         if not schedule.every_ms or schedule.every_ms <= 0:
+             # 间隔非法，跳过
             return None
         # Next interval from now
         return now_ms + schedule.every_ms
 
+    # ── 模式三：cron（标准 cron 表达式）─────────────────────────────────
+    # 借助 croniter 库解析 cron 表达式，支持时区（tz 字段）
     if schedule.kind == "cron" and schedule.expr:
         try:
             from zoneinfo import ZoneInfo
 
             from croniter import croniter
             # Use caller-provided reference time for deterministic scheduling
+            # 以 now_ms 为基准时间，保证调度结果确定性（不受函数调用时刻影响）
             base_time = now_ms / 1000
             tz = ZoneInfo(schedule.tz) if schedule.tz else datetime.now().astimezone().tzinfo
             base_dt = datetime.fromtimestamp(base_time, tz=tz)
             cron = croniter(schedule.expr, base_dt)
+            # 获取下一个满足表达式的时间点
             next_dt = cron.get_next(datetime)
             return int(next_dt.timestamp() * 1000)
         except Exception:
+            # 表达式非法或时区错误，返回 None
             return None
 
     return None
@@ -174,6 +193,7 @@ class CronService:
     
     async def start(self) -> None:
         """Start the cron service."""
+        """通常在应用初始化时调用一次"""
         self._running = True
         self._load_store()
         self._recompute_next_runs()
@@ -207,39 +227,63 @@ class CronService:
 
     def _arm_timer(self) -> None:
         """Schedule the next timer tick."""
+        """设置（或重置）下一次定时唤醒任务。
+
+        每次调度状态发生变化（新增/修改/删除任务、任务执行完毕）后都会调用此函数，
+        确保始终只有一个活跃的定时器，且精确指向最近一次需要触发的时间点。
+        """
+        # 若已存在旧的定时器任务，先取消，避免重复触发
         if self._timer_task:
             self._timer_task.cancel()
 
+        # 查询所有已启用任务中最早的下一次执行时间
         next_wake = self._get_next_wake_ms()
+        # 若没有待执行的任务，或服务已停止，则不再设置新定时器
         if not next_wake or not self._running:
             return
 
+        # 计算距离下次唤醒还需等待多少秒（最小为 0，防止负数）
         delay_ms = max(0, next_wake - _now_ms())
         delay_s = delay_ms / 1000
 
         async def tick():
+            # 等待指定时长后触发一次调度检查
             await asyncio.sleep(delay_s)
+            # 再次确认服务仍在运行，避免停止后的残留任务误触发
             if self._running:
                 await self._on_timer()
 
+        # 将 tick 协程包装为后台 Task，挂载到事件循环
         self._timer_task = asyncio.create_task(tick())
 
     async def _on_timer(self) -> None:
         """Handle timer tick - run due jobs."""
+        """定时器到期后的调度入口，负责找出所有到期任务并依次执行。
+
+        由 _arm_timer 内部的 tick() 协程在等待结束后调用。
+        执行完毕后会保存状态并重新设置下一次定时器，形成自驱动的调度循环：
+            _arm_timer → 等待 → _on_timer → _execute_job(s) → _arm_timer → …
+        """
+        # 重新从磁盘加载任务列表，感知外部对 jobs.json 的修改
         self._load_store()
         if not self._store:
             return
 
         now = _now_ms()
+        # 筛选所有"已启用 且 next_run_at_ms 已到期"的任务
+        # 使用 >= 而非 == 是为了容忍轻微的时钟误差或调度延迟
         due_jobs = [
             j for j in self._store.jobs
             if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
         ]
 
+        # 逐个执行到期任务（内部会更新状态、计算下次执行时间）
         for job in due_jobs:
             await self._execute_job(job)
 
+        # 将所有任务的最新状态持久化到磁盘
         self._save_store()
+        # 根据更新后的 next_run_at_ms 重新设置下一次定时器
         self._arm_timer()
 
     async def _execute_job(self, job: CronJob) -> None:
@@ -250,6 +294,9 @@ class CronService:
         try:
             response = None
             if self.on_job:
+                # self.on_job 是一个外部注入的回调函数，在 CronService.__init__ 时传入
+                # 接收一个 CronJob，然后真正去驱动 Agent 执行任务（比如发起一次 Agent 对话、发送消息等）。
+                # CronService 本身只负责调度，不关心任务的具体业务逻辑，业务逻辑全部委托给 on_job 回调。
                 response = await self.on_job(job)
 
             job.state.last_status = "ok"

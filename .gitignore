@@ -23,3 +23,7 @@ botpy.log
 nano.*.save
 .DS_Store
 uv.lock
+
+
+.nanobot
+.vscode/

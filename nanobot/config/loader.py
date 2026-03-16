@@ -39,7 +39,9 @@ def load_config(config_path: Path | None = None) -> Config:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
+            # 用于将旧版本的配置格式升级为当前版本，保证向后兼容性。防止用户用的是老版本的 config.json
             data = _migrate_config(data)
+            # 用于将一个普通 dict 解析并验证为 Config 模型对象
             return Config.model_validate(data)
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")

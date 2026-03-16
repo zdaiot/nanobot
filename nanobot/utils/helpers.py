@@ -180,8 +180,18 @@ def estimate_prompt_tokens_chain(
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
     """Sync bundled templates to workspace. Only creates missing files."""
+    """将包内置的模板文件同步到工作区目录，只创建缺失的文件，不覆盖已有文件。
+
+    Args:
+        workspace: 目标工作区目录路径。
+        silent: 为 True 时不打印创建提示，默认 False。
+
+    Returns:
+        新创建的文件路径列表（相对于 workspace）。
+    """
     from importlib.resources import files as pkg_files
     try:
+        # 定位包内 templates 资源目录
         tpl = pkg_files("nanobot") / "templates"
     except Exception:
         return []
@@ -191,19 +201,25 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     added: list[str] = []
 
     def _write(src, dest: Path):
+        """将 src 写入 dest，若 dest 已存在则跳过。src 为 None 时写入空文件。"""
         if dest.exists():
             return
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(src.read_text(encoding="utf-8") if src else "", encoding="utf-8")
         added.append(str(dest.relative_to(workspace)))
 
+    # 将 templates/ 下所有 .md 文件复制到工作区根目录
     for item in tpl.iterdir():
         if item.name.endswith(".md") and not item.name.startswith("."):
             _write(item, workspace / item.name)
+    # 复制记忆模板到 memory/ 子目录
     _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
+    # 创建空的历史记录文件（如不存在）
     _write(None, workspace / "memory" / "HISTORY.md")
+    # 确保 skills/ 目录存在
     (workspace / "skills").mkdir(exist_ok=True)
 
+    # 打印新创建的文件列表
     if added and not silent:
         from rich.console import Console
         for name in added:

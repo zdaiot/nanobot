@@ -48,6 +48,24 @@ class HeartbeatService:
     Phase 2 (execution): only triggered when Phase 1 returns ``run``.  The
     ``on_execute`` callback runs the task through the full agent loop and
     returns the result to deliver.
+
+    定时心跳服务，周期性地唤醒 Agent 检查是否有待执行的任务。
+
+    Cron 有一个根本局限：**它只能执行用户预先安排好的任务**。但有些场景是 Cron 覆盖不了的：
+    | 场景 | Cron 能做吗？ | Heartbeat 能做吗？ |
+    |------|-------------|-----------------|
+    | 每天9点发提醒 | ✅ 精确触发 | ✅ 但不如 Cron 精确 |
+    | 监控某个条件成立时主动通知 | ❌ 不知道条件何时成立 | ✅ 每次心跳时 LLM 判断 |
+    | 根据上下文灵活决定是否要做某事 | ❌ 只能机械执行 | ✅ LLM 有推理能力 |
+    | 用户在 `HEARTBEAT.md` 写了模糊指令 | ❌ 无法解析自然语言 | ✅ LLM 理解语义 |
+
+    工作流程分两个阶段：
+    - 阶段一（决策）：读取工作目录下的 HEARTBEAT.md 文件，利用 LLM 的 Tool
+      Calling 能力（_HEARTBEAT_TOOL）将决策结果约束为结构化 JSON，让 LLM 判断
+      文件中描述的事项当前是否需要执行，返回 ``skip``（无需执行）或 ``run``
+      （需要执行）。相比自由文本解析，此方式更可靠。
+    - 阶段二（执行）：仅当阶段一返回 ``run`` 时触发，调用 ``on_execute`` 回调
+      将任务交给完整的 Agent 循环处理，并通过 ``on_notify`` 回调将结果推送出去。    
     """
 
     def __init__(
@@ -110,6 +128,8 @@ class HeartbeatService:
 
     async def start(self) -> None:
         """Start the heartbeat service."""
+        """通常在应用初始化时调用一次
+        """
         if not self.enabled:
             logger.info("Heartbeat disabled")
             return

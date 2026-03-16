@@ -15,6 +15,8 @@ class CronTool(Tool):
         self._cron = cron_service
         self._channel = ""
         self._chat_id = ""
+        # ContextVar 是 Python 标准库 contextvars 提供的协程安全的上下文变量
+        # 每个 asyncio Task 拥有独立的变量副本，互不干扰
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
 
     def set_context(self, channel: str, chat_id: str) -> None:

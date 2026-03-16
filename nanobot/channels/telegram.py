@@ -219,13 +219,27 @@ class TelegramChannel(BaseChannel):
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
+        """
+        start() 两层循环结构
+        ├── updater.start_polling()   ← 第一层：后台轮询循环（由 PTB 框架驱动）
+        └── while self._running:      ← 第二层：守护循环（保持 start 协程不退出）
+                await asyncio.sleep(1)
+        """
+        # 检查 token 是否已配置，未配置则无法启动
         if not self.config.token:
             logger.error("Telegram bot token not configured")
             return
 
+        # 标记 bot 为运行状态，用于控制主循环
         self._running = True
 
         # Build the application with larger connection pool to avoid pool-timeout on long runs
+        # 构建 HTTPX 请求对象，配置连接池和超时参数
+        # connection_pool_size=16：允许同时维持 16 个 HTTP 连接，避免长时间运行时连接池耗尽
+        # pool_timeout=5.0：从连接池获取连接的最大等待时间（秒）
+        # connect_timeout=30.0：建立 TCP 连接的超时时间（秒）
+        # read_timeout=30.0：等待服务器响应的超时时间（秒）
+        # proxy：若配置了代理则使用，否则为 None
         req = HTTPXRequest(
             connection_pool_size=16,
             pool_timeout=5.0,
@@ -233,18 +247,29 @@ class TelegramChannel(BaseChannel):
             read_timeout=30.0,
             proxy=self.config.proxy if self.config.proxy else None,
         )
+        # 使用 Builder 模式构建 Application 实例
+        # .token()：设置 Bot Token
+        # .request()：设置普通 API 请求使用的 HTTP 客户端
+        # .get_updates_request()：设置 getUpdates 长轮询专用的 HTTP 客户端（与普通请求分离，避免互相阻塞）
         builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
         self._app = builder.build()
+        # 注册全局错误处理器，捕获轮询或 handler 中未处理的异常
         self._app.add_error_handler(self._on_error)
 
         # Add command handlers
+        # 注册命令处理器（对应 Telegram 的 /命令）
+        # /start：欢迎消息，由 _on_start 单独处理
         self._app.add_handler(CommandHandler("start", self._on_start))
+        # /new、/stop、/restart：转发到消息总线，由 AgentLoop 统一处理业务逻辑
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("restart", self._forward_command))
+        # /help：帮助信息，绕过 ACL 权限检查，所有用户均可访问
         self._app.add_handler(CommandHandler("help", self._on_help))
 
         # Add message handler for text, photos, voice, documents
+        # 注册普通消息处理器，支持文本、图片、语音、音频、文件等类型
+        # ~filters.COMMAND 排除命令消息，避免与命令处理器重复处理
         self._app.add_handler(
             MessageHandler(
                 (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL)
@@ -256,15 +281,19 @@ class TelegramChannel(BaseChannel):
         logger.info("Starting Telegram bot (polling mode)...")
 
         # Initialize and start polling
+        # 初始化 Application（建立内部状态、连接等）
         await self._app.initialize()
+        # 启动 Application（启动内部任务队列等）
         await self._app.start()
 
         # Get bot info and register command menu
+        # 获取 Bot 自身信息（id、username），用于后续群组消息中判断是否 @了本 bot
         bot_info = await self._app.bot.get_me()
         self._bot_user_id = getattr(bot_info, "id", None)
         self._bot_username = getattr(bot_info, "username", None)
         logger.info("Telegram bot @{} connected", bot_info.username)
 
+        # 向 Telegram 注册命令菜单（用户在输入框输入 / 时显示的命令列表）
         try:
             await self._app.bot.set_my_commands(self.BOT_COMMANDS)
             logger.debug("Telegram bot commands registered")
@@ -272,12 +301,26 @@ class TelegramChannel(BaseChannel):
             logger.warning("Failed to register bot commands: {}", e)
 
         # Start polling (this runs until stopped)
+        # 启动长轮询（持续向 Telegram 服务器请求新消息）。框架开始不断拉取消息，并自动分发给上面注册的 Handler
+        # allowed_updates=["message"]：只接收普通消息更新，忽略其他类型（如 inline_query 等）
+        # drop_pending_updates=True：启动时丢弃积压的旧消息，避免重复处理
+        #
+        # 【为什么长轮询不会真正"断开"】
+        # 1. 每次请求独立：长轮询不是 WebSocket，每个 getUpdates 都是独立的 HTTP 请求，
+        #    服务器返回（有消息立即返回，无消息最多等 read_timeout=30s）后连接自然关闭，
+        #    框架立即发起下一个请求，形成无缝循环。
+        # 2. 连接池复用：connection_pool_size=16 维持 TCP 连接池，避免每次重新握手，
+        #    pool_timeout=5.0 控制从池中获取连接的最大等待时间。
+        # 3. 框架自动重连：PTB 内部捕获网络异常并自动重试，错误会触发 _on_error 回调打印日志，
+        #    网络抖动或 Telegram 服务器重启均不会导致 Bot 停止工作。
+        # 4. 永不主动断开：除非调用 stop() 将 _running 置为 False，或进程退出。
         await self._app.updater.start_polling(
             allowed_updates=["message"],
             drop_pending_updates=True  # Ignore old messages on startup
         )
 
         # Keep running until stopped
+        # 主循环：每秒检查一次运行状态，直到 _running 被置为 False（由 stop() 触发）
         while self._running:
             await asyncio.sleep(1)
 
@@ -590,13 +633,23 @@ class TelegramChannel(BaseChannel):
 
     async def _is_group_message_for_bot(self, message) -> bool:
         """Allow group messages when policy is open, @mentioned, or replying to the bot."""
+        # 群组消息过滤器：判断该消息是否需要 Bot 响应
+        # 满足以下任一条件则返回 True（处理该消息），否则返回 False（忽略）：
+        #   1. 私聊消息（chat.type == "private"）
+        #   2. 群组策略配置为 "open"（响应所有群消息）
+        #   3. 消息文本或图片说明中 @了 Bot
+        #   4. 消息是对 Bot 发出的消息的回复
+
+        # 条件 1 & 2：私聊直接放行；open 策略下所有群消息都响应
         if message.chat.type == "private" or self.config.group_policy == "open":
             return True
 
+        # 获取 Bot 自身的 id 和 username，用于后续 @ 检测和回复检测
         bot_id, bot_username = await self._ensure_bot_identity()
         if bot_username:
             text = message.text or ""
             caption = message.caption or ""
+            # 条件 3a：检测消息正文中是否 @了 Bot（通过 entities 实体列表精确匹配）
             if self._has_mention_entity(
                 text,
                 getattr(message, "entities", None),
@@ -604,6 +657,7 @@ class TelegramChannel(BaseChannel):
                 bot_id,
             ):
                 return True
+            # 条件 3b：检测图片/文件的 caption 中是否 @了 Bot
             if self._has_mention_entity(
                 caption,
                 getattr(message, "caption_entities", None),
@@ -612,6 +666,7 @@ class TelegramChannel(BaseChannel):
             ):
                 return True
 
+        # 条件 4：消息是对 Bot 发出的消息的回复（reply_to_message.from_user.id == bot_id）
         reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
         return bool(bot_id and reply_user and reply_user.id == bot_id)
 
@@ -642,32 +697,43 @@ class TelegramChannel(BaseChannel):
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
+        # PTB 框架在收到新消息时自动回调此函数（已在 start() 中通过 add_handler 注册）
+        # 处理范围：文本、图片、语音、音频、文件（命令消息由专属 CommandHandler 处理，不会到达这里）
         if not update.message or not update.effective_user:
             return
 
         message = update.message
         user = update.effective_user
         chat_id = message.chat_id
+        # 构建 sender_id，格式为 "user_id|username"（无 username 时仅为 "user_id"）
         sender_id = self._sender_id(user)
+        # 缓存话题线程 ID，供后续 Bot 回复时定位到正确的群组话题
         self._remember_thread_context(message)
 
         # Store chat_id for replies
+        # 记录 sender_id → chat_id 的映射，供主动推送消息时查找目标会话
         self._chat_ids[sender_id] = chat_id
 
+        # 群组消息过滤：不满足响应条件（未 @Bot、非回复 Bot、非 open 策略）则直接忽略
         if not await self._is_group_message_for_bot(message):
             return
 
         # Build content from text and/or media
+        # 逐步拼装消息内容：文本 + 媒体描述 + 引用上下文，最终合并为一个字符串投递给 AgentLoop
         content_parts = []
         media_paths = []
 
         # Text content
+        # 提取消息正文（普通文本消息）
         if message.text:
             content_parts.append(message.text)
+        # 提取图片/文件的说明文字（caption）
         if message.caption:
             content_parts.append(message.caption)
 
         # Download current message media
+        # 下载当前消息中的媒体文件（图片/语音/音频/文件）到本地，返回文件路径和描述文本
+        # add_failure_content=True：下载失败时也追加一条失败提示，让 Agent 知道有媒体但无法获取
         current_media_paths, current_media_parts = await self._download_message_media(
             message, add_failure_content=True
         )
@@ -677,28 +743,40 @@ class TelegramChannel(BaseChannel):
             logger.debug("Downloaded message media to {}", current_media_paths[0])
 
         # Reply context: text and/or media from the replied-to message
+        # 如果当前消息是对某条消息的回复，则把被回复消息的内容也一并附上，给 Agent 提供上下文
         reply = getattr(message, "reply_to_message", None)
         if reply is not None:
+            # 提取被回复消息的文本（超长则截断），格式为 "[Reply to: ...]" 前缀
             reply_ctx = self._extract_reply_context(message)
+            # 同时尝试下载被回复消息中的媒体文件
             reply_media, reply_media_parts = await self._download_message_media(reply)
             if reply_media:
+                # 被回复的媒体放在 media_paths 最前面，保证上下文顺序正确
                 media_paths = reply_media + media_paths
                 logger.debug("Attached replied-to media: {}", reply_media[0])
+            # 优先使用文本引用上下文，其次使用媒体描述作为引用标签
             tag = reply_ctx or (f"[Reply to: {reply_media_parts[0]}]" if reply_media_parts else None)
             if tag:
+                # 引用上下文插入到 content_parts 最前面，让 Agent 先看到上下文再看到当前消息
                 content_parts.insert(0, tag)
+        # 将所有内容片段合并为最终消息字符串；若无任何内容则标记为空消息
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)
+        # 构建消息元数据（message_id、user_id、是否群组、话题 ID 等），随消息一起投递
         metadata = self._build_message_metadata(message, user)
+        # 推导 session key：群组话题消息使用独立 session，私聊/普通群组返回 None（使用默认 session）
         session_key = self._derive_topic_session_key(message)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
+        # 媒体组处理：用户一次发多张图片时，Telegram 会拆分为多个独立 Update，但共享同一个 media_group_id
+        # 策略：先把同组的所有图片缓冲起来，等待 0.6s 后由 _flush_media_group 合并为一条消息再投递
         if media_group_id := getattr(message, "media_group_id", None):
             key = f"{str_chat_id}:{media_group_id}"
             if key not in self._media_group_buffers:
+                # 首张图片到达时初始化缓冲区，并立即启动 typing 指示器
                 self._media_group_buffers[key] = {
                     "sender_id": sender_id, "chat_id": str_chat_id,
                     "contents": [], "media": [],
@@ -707,17 +785,22 @@ class TelegramChannel(BaseChannel):
                 }
                 self._start_typing(str_chat_id)
             buf = self._media_group_buffers[key]
+            # 将当前图片的文字说明追加到缓冲区
             if content and content != "[empty message]":
                 buf["contents"].append(content)
+            # 将当前图片路径追加到缓冲区
             buf["media"].extend(media_paths)
             if key not in self._media_group_tasks:
+                # 只创建一个定时任务，等 0.6s 后统一合并发送（后续同组图片复用同一任务）
                 self._media_group_tasks[key] = asyncio.create_task(self._flush_media_group(key))
             return
 
         # Start typing indicator before processing
+        # 非媒体组消息：立即启动 typing 指示器，让用户知道 Bot 正在处理
         self._start_typing(str_chat_id)
 
         # Forward to the message bus
+        # 将消息投递到 MessageBus，由 AgentLoop 异步消费并生成回复
         await self._handle_message(
             sender_id=sender_id,
             chat_id=str_chat_id,

@@ -108,27 +108,41 @@ class SkillsLoader:
         Returns:
             XML-formatted skills summary.
         """
+        """
+        功能：构建所有 skill 的摘要（名称、描述、路径、可用性）
+        用途：用于渐进式加载，agent 先看摘要，需要时再通过 read_file 读取完整内容。
+             read_file工具在nanobot/agent/tools/filesystem.py
+        返回值：XML 格式的字符串. 比json格式更容错
+        """
+        # 获取所有 skill（包含不满足依赖条件的），用于生成完整摘要
         all_skills = self.list_skills(filter_unavailable=False)
         if not all_skills:
             return ""
 
+        # XML 特殊字符转义，防止 &、<、> 破坏 XML 结构
         def escape_xml(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
         lines = ["<skills>"]
         for s in all_skills:
+            # 对 name、desc 做 XML 转义；path 作为路径直接使用
             name = escape_xml(s["name"])
             path = s["path"]
             desc = escape_xml(self._get_skill_description(s["name"]))
+            # 获取该 skill 的 nanobot 元数据（用于检查依赖）
             skill_meta = self._get_skill_meta(s["name"])
+            # 检查 bins / env 依赖是否满足，决定 available 属性
             available = self._check_requirements(skill_meta)
 
+            # 每个 skill 用 <skill available="true/false"> 标签包裹
             lines.append(f"  <skill available=\"{str(available).lower()}\">")
             lines.append(f"    <name>{name}</name>")
             lines.append(f"    <description>{desc}</description>")
+            # location 指向 SKILL.md 的绝对路径，agent 可通过 read_file 读取完整内容
             lines.append(f"    <location>{path}</location>")
 
             # Show missing requirements for unavailable skills
+            # 仅对不可用的 skill 追加 <requires> 标签，说明缺少哪些依赖（CLI 工具或环境变量）
             if not available:
                 missing = self._get_missing_requirements(skill_meta)
                 if missing:
@@ -137,6 +151,7 @@ class SkillsLoader:
             lines.append("  </skill>")
         lines.append("</skills>")
 
+        # 将所有行拼接为完整的 XML 字符串返回
         return "\n".join(lines)
 
     def _get_missing_requirements(self, skill_meta: dict) -> str:
@@ -210,14 +225,23 @@ class SkillsLoader:
         Returns:
             Metadata dict or None.
         """
+        # 加载SKILL.md
         content = self.load_skill(name)
         if not content:
             return None
 
+        # SKILL.md 文件可能包含 YAML frontmatter（前置元数据块），格式为：
+        #   ---
+        #   key: value
+        #   ---
+        #   正文内容...
+        # 以 "---" 开头说明存在 frontmatter，需要解析其中的元数据
         if content.startswith("---"):
+            # 用正则匹配两个 "---" 之间的内容（re.DOTALL 使 "." 能匹配换行符）
             match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
             if match:
                 # Simple YAML parsing
+                # 简单 YAML 解析：逐行按 "key: value" 格式提取，去除首尾引号
                 metadata = {}
                 for line in match.group(1).split("\n"):
                     if ":" in line:
@@ -225,4 +249,5 @@ class SkillsLoader:
                         metadata[key.strip()] = value.strip().strip('"\'')
                 return metadata
 
+        # 没有 frontmatter 则返回 None
         return None

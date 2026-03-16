@@ -26,6 +26,13 @@ class ContextBuilder:
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """
+        1. Identity（核心身份 + Guidelines）   ← _get_identity()
+        2. Bootstrap Files（用户定制层）        ← AGENTS.md / SOUL.md / USER.md / TOOLS.md
+        3. Memory（长期记忆）                   ← memory/MEMORY.md
+        4. Always-on Skills（常驻技能）
+        5. Skills Summary（可用技能列表）
+        """
         parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()

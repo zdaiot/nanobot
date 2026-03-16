@@ -75,6 +75,38 @@ async def connect_mcp_servers(
     mcp_servers: dict, registry: ToolRegistry, stack: AsyncExitStack
 ) -> None:
     """Connect to configured MCP servers and register their tools."""
+    """
+    MCP 支持三种传输方式，决定了 nanobot 如何与 MCP Server 建立通信通道：
+
+    - stdio（本地子进程）
+        nanobot 启动一个子进程（如 `python server.py`），
+        通过子进程的标准输入/输出（stdin/stdout）收发消息。
+        适合本地命令行工具，配置中需提供 command 字段。
+
+    - sse（HTTP 长连接，旧版协议）
+        nanobot 向远程 HTTP 服务发起一次请求，连接保持不断开。
+        服务端可以随时往这条连接里写数据推给 nanobot，
+        不需要 nanobot 再次发请求（这就是"主动推送"的含义）。
+        如果nanobot再次向远程 HTTP 服务发起一次请求？用的也是同一个连接
+        适合旧版远程 MCP Server，URL 通常以 /sse 结尾。
+
+    - streamableHttp（HTTP 流式，新版协议，推荐）
+        nanobot 每次发一个请求，服务端立即开始返回响应，
+        但响应体是流式的（边处理边返回），响应结束后连接关闭。
+        本质仍是"请求-响应"，服务端不会主动推送，
+        与 SSE 的区别在于：连接不长期保持，每次交互都是独立的请求。
+
+        SSE 是为"服务端主动推送"设计的，但 MCP 工具调用是请求-响应模式，用 SSE 是大材小用，
+        还带来了一堆运维麻烦。streamableHttp 更契合实际使用场景。
+
+    三种方式最终都返回 (read, write) 通道，
+    上层的 ClientSession 通过这对通道收发结构化的 MCP 协议消息，
+    与具体传输方式无关。
+    """
+    # stdio_client / sse_client / streamable_http_client：
+    #   各传输方式的异步上下文管理器工厂，进入时建立连接，退出时自动断开，返回 (read, write) 通道。
+    # ClientSession：MCP 协议层会话，把底层 (read, write) 字节流包装成结构化的 MCP 调用。
+    # StdioServerParameters：封装启动子进程所需的 command/args/env 三个参数的数据类。
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
     from mcp.client.stdio import stdio_client
@@ -82,12 +114,15 @@ async def connect_mcp_servers(
 
     for name, cfg in mcp_servers.items():
         try:
+            # 确定传输类型：优先使用配置中显式指定的 type，
+            # 否则根据 command/url 自动推断。
             transport_type = cfg.type
             if not transport_type:
                 if cfg.command:
                     transport_type = "stdio"
                 elif cfg.url:
                     # Convention: URLs ending with /sse use SSE transport; others use streamableHttp
+                    # 约定：URL 以 /sse 结尾使用 SSE 传输，否则使用 streamableHttp
                     transport_type = (
                         "sse" if cfg.url.rstrip("/").endswith("/sse") else "streamableHttp"
                     )
@@ -95,12 +130,20 @@ async def connect_mcp_servers(
                     logger.warning("MCP server '{}': no command or url configured, skipping", name)
                     continue
 
+            # 根据传输类型建立底层读写通道（read/write）。
+            # stack.enter_async_context(ctx) 等价于 `async with ctx as result`，
+            # 但把"退出时关闭"的责任交给了 stack 统一管理，
+            # 这样连接可以跨方法存活，直到 stack.aclose() 被调用时才统一关闭。
             if transport_type == "stdio":
+                # stdio：通过子进程的标准输入/输出与 MCP Server 通信
+                # StdioServerParameters：封装启动子进程所需的 command/args/env 三个参数的数据类
                 params = StdioServerParameters(
                     command=cfg.command, args=cfg.args, env=cfg.env or None
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
             elif transport_type == "sse":
+                # SSE：通过 HTTP Server-Sent Events 长连接与 MCP Server 通信。
+                # 自定义 httpx_client_factory，将配置中的自定义 headers 合并进去。
                 def httpx_client_factory(
                     headers: dict[str, str] | None = None,
                     timeout: httpx.Timeout | None = None,
@@ -120,6 +163,9 @@ async def connect_mcp_servers(
             elif transport_type == "streamableHttp":
                 # Always provide an explicit httpx client so MCP HTTP transport does not
                 # inherit httpx's default 5s timeout and preempt the higher-level tool timeout.
+                # streamableHttp：通过 HTTP 流式请求与 MCP Server 通信。
+                # 显式创建 httpx.AsyncClient 并设 timeout=None，
+                # 避免继承 httpx 默认 5s 超时而提前中断，超时由上层工具调用控制。
                 http_client = await stack.enter_async_context(
                     httpx.AsyncClient(
                         headers=cfg.headers or None,
@@ -134,9 +180,12 @@ async def connect_mcp_servers(
                 logger.warning("MCP server '{}': unknown transport type '{}'", name, transport_type)
                 continue
 
+            # 用读写通道创建 MCP 协议层会话，同样注册进 stack 管理生命周期。
+            # initialize() 完成 MCP 握手协议（双方互报能力），之后才能正常调用工具。
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
 
+            # 拉取该 Server 暴露的所有工具，逐一包装后注册到 nanobot 工具注册表。
             tools = await session.list_tools()
             enabled_tools = set(cfg.enabled_tools)
             allow_all_tools = "*" in enabled_tools

@@ -33,6 +33,12 @@ class ToolRegistry:
 
     def get_definitions(self) -> list[dict[str, Any]]:
         """Get all tool definitions in OpenAI format."""
+        """
+        registry.get_definitions()
+            └─ 遍历所有 Tool，调用 tool.to_schema()
+                └─ 返回 OpenAI function calling 格式的 JSON
+                    └─ 作为 tools 参数传给 LLM API
+        """
         return [tool.to_schema() for tool in self._tools.values()]
 
     async def execute(self, name: str, params: dict[str, Any]) -> str:

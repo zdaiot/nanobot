@@ -18,6 +18,27 @@ if TYPE_CHECKING:
     from nanobot.session.manager import Session, SessionManager
 
 
+# OpenAI Function Calling 格式的工具定义，随 HTTP 请求体一起发给 LLM。
+# LLM 不执行任何代码，只负责按 schema 生成符合格式的 JSON 参数并返回。
+# 我们再从 response.tool_calls[0].arguments 中取出参数，写入本地文件。
+#
+# 数据流向：
+#   我们 → LLM : messages（对话内容）+ tools（本工具定义）
+#   LLM → 我们 : tool_calls[0].arguments = { history_entry, memory_update }
+#
+# 字段说明（均为 LLM 输出的参数，非输入）：
+#   history_entry  : 本次对话的摘要段落，追加写入 HISTORY.md（可 grep 检索）
+#   memory_update  : 更新后的完整长期记忆，覆盖写入 MEMORY.md
+#
+# properties = 声明参数名称、类型及描述（相当于表单填写项说明）
+# required   = 指定哪些参数是必填的
+#
+# vLLM Guided Decoding：
+#   vLLM 收到 tools 字段后，会提取 parameters 中的 JSON Schema，
+#   在推理时对每步 token 做 logits masking（将不合法 token 的概率置为 -∞，模型只能从合法 token 中采样 ），
+#   强制模型只能输出符合 schema 的 JSON，保证 arguments 结构合法。
+#   其他 provider（如普通 OpenAI）依赖模型自身理解，输出格式不保证，
+#   因此下方对 arguments 做了 str / list / dict 的防御性类型检查。
 _SAVE_MEMORY_TOOL = [
     {
         "type": "function",
@@ -257,20 +278,45 @@ class MemoryConsolidator:
         tokens_to_remove: int,
     ) -> tuple[int, int] | None:
         """Pick a user-turn boundary that removes enough old prompt tokens."""
+        """
+        在会话消息列表中，找到一个「用户轮次边界」，使得归档该边界之前的消息
+        能够减少至少 tokens_to_remove 个 token。
+
+        「用户轮次边界」的含义：某条 role=="user" 消息的索引位置。
+        归档时会取 [last_consolidated, boundary_idx) 这段消息，
+        边界选在用户消息开头，保证归档后剩余的上下文仍以完整的用户轮次开始，
+        不会出现孤立的 assistant/tool 消息破坏对话结构。
+
+        返回值：(boundary_idx, removed_tokens)
+          - boundary_idx   : 本轮归档的结束索引（不含），即下一轮的起始位置
+          - removed_tokens : 归档这段消息预计减少的 token 数
+        返回 None 表示找不到合适边界（消息已全部归档，或不足一个完整用户轮次）。
+        """
+        # 从上次归档结束的位置开始扫描，避免重复处理已归档的消息
         start = session.last_consolidated
+        # 前置检查：所有消息已归档，或调用方未要求减少任何 token，直接返回 None
         if start >= len(session.messages) or tokens_to_remove <= 0:
             return None
 
+        # 累计已扫描消息的 token 数，用于判断是否已达到目标减少量
         removed_tokens = 0
+        # 记录最近一次满足「用户轮次边界」条件的候选结果，
+        # 若遍历结束仍未达到 tokens_to_remove，则返回能减少最多 token 的那个边界
         last_boundary: tuple[int, int] | None = None
         for idx in range(start, len(session.messages)):
             message = session.messages[idx]
+            # 只在 idx > start 时才允许作为边界：
+            # 若 idx == start，归档区间为空（[start, start)），没有意义
             if idx > start and message.get("role") == "user":
+                # 更新候选边界：当前用户消息索引 + 截至此处已累计的 token 数
                 last_boundary = (idx, removed_tokens)
+                # 已累计的 token 数达到目标，立即返回，无需继续扫描
                 if removed_tokens >= tokens_to_remove:
                     return last_boundary
+            # 将当前消息的 token 数累加到计数器（无论是否是边界消息都要累加）
             removed_tokens += estimate_message_tokens(message)
 
+        # 遍历结束仍未达到目标：返回最后一个用户轮次边界（可能为 None）
         return last_boundary
 
     def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
@@ -301,15 +347,30 @@ class MemoryConsolidator:
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
         """Loop: archive old messages until prompt fits within half the context window."""
+        """
+        触发条件：当前 prompt 的 token 数超过 context_window_tokens 时触发。
+        压缩目标：将 token 数降至 context_window_tokens // 2 以下，为新消息留出空间。
+        压缩方式：每轮找到一个"用户轮次边界"，将该边界之前的旧消息批量归档到
+                  MEMORY.md（长期记忆）和 HISTORY.md（可检索历史日志），
+                  并更新 session.last_consolidated 游标，避免重复归档。
+        并发安全：通过 per-session asyncio.Lock 保证同一会话不会并发触发多次压缩。
+        最大轮次：由 _MAX_CONSOLIDATION_ROUNDS 限制，防止无限循环。
+        """
+        # 前置检查：会话无消息或未配置上下文窗口大小时，直接跳过
         if not session.messages or self.context_window_tokens <= 0:
             return
 
+        # 获取该会话的专属锁，防止并发触发多次压缩导致数据竞争
         lock = self.get_lock(session.key)
         async with lock:
+            # 目标：将 prompt token 数压缩到上下文窗口的一半以下，留出足够空间给新消息
             target = self.context_window_tokens // 2
+            # 估算当前 prompt 的 token 数，source 表示估算来源（如 tiktoken / 字符估算等）
             estimated, source = self.estimate_session_prompt_tokens(session)
+            # 估算失败（返回 0）时跳过，避免基于无效数据做压缩决策
             if estimated <= 0:
                 return
+            # 当前 token 数未超出上下文窗口，无需压缩，记录 debug 日志后返回
             if estimated < self.context_window_tokens:
                 logger.debug(
                     "Token consolidation idle {}: {}/{} via {}",
@@ -320,11 +381,16 @@ class MemoryConsolidator:
                 )
                 return
 
+            # 多轮压缩循环：每轮归档一批旧消息，直到 token 数降至目标值或达到最大轮次
             for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
+                # 已降至目标以下，压缩完成，退出循环
                 if estimated <= target:
                     return
 
+                # 找到一个安全的用户轮次边界，使归档该边界之前的消息能减少足够的 token
+                # max(1, ...) 确保至少要求减少 1 个 token，避免传入 0 导致边界查找逻辑异常
                 boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
+                # 找不到合适边界（如消息全部已归档，或剩余消息不足一个用户轮次）时退出
                 if boundary is None:
                     logger.debug(
                         "Token consolidation: no safe boundary for {} (round {})",
@@ -333,8 +399,11 @@ class MemoryConsolidator:
                     )
                     return
 
+                # boundary[0] 是本轮归档的结束索引（不含），即下一轮的起始位置
                 end_idx = boundary[0]
+                # 取出本轮待归档的消息片段：从上次归档结束位置到本轮边界
                 chunk = session.messages[session.last_consolidated:end_idx]
+                # 片段为空说明边界与上次归档位置重合，无新内容可归档，退出
                 if not chunk:
                     return
 
@@ -347,11 +416,16 @@ class MemoryConsolidator:
                     source,
                     len(chunk),
                 )
+                # 将该片段消息归档到持久化记忆（MEMORY.md + HISTORY.md），失败则中止本次压缩
                 if not await self.consolidate_messages(chunk):
                     return
+                # 更新会话的已归档偏移量，标记这批消息已被压缩，下次不再重复处理
                 session.last_consolidated = end_idx
+                # 持久化会话状态，确保 last_consolidated 在重启后仍然有效
                 self.sessions.save(session)
 
+                # 重新估算压缩后的 token 数，决定是否需要继续下一轮压缩
                 estimated, source = self.estimate_session_prompt_tokens(session)
+                # 估算失败时退出，避免死循环
                 if estimated <= 0:
                     return

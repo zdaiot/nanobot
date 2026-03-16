@@ -112,24 +112,33 @@ class ChannelManager:
 
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
+        """将消息发送给合适的channel"""
         logger.info("Outbound dispatcher started")
 
         while True:
             try:
+                # 等待agent到channel的消息
                 msg = await asyncio.wait_for(
                     self.bus.consume_outbound(),
                     timeout=1.0
                 )
 
+                # _progress 是一个元数据标记，表示这条消息是一条中间进度消息（而非最终回复），
+                # 比如 Agent 正在思考、调用工具时发出的实时状态通知。
                 if msg.metadata.get("_progress"):
+                    # 如果是进度消息，且带有 _tool_hint 标记（说明是"工具调用提示"，比如"正在搜索..."），
+                    # 但配置里 send_tool_hints = False（用户不想看工具提示），则 continue 跳过，不发送
                     if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
                         continue
+                    # 如果是进度消息，但不是工具提示（是普通进度，比如"正在思考..."），
+                    # 但配置里 send_progress = False（用户不想看进度消息），则 continue 跳过，不发送。
                     if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
                         continue
 
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:
+                        # 向channel发送消息
                         await channel.send(msg)
                     except Exception as e:
                         logger.error("Error sending to {}: {}", msg.channel, e)

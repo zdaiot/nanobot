@@ -169,23 +169,36 @@ class Config(BaseSettings):
         self, model: str | None = None
     ) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
+        """根据模型名称匹配对应的 provider 配置及其注册名，返回 (config, spec_name)。
+
+        匹配优先级：
+          1. 若 provider 被强制指定（非 "auto"），直接返回对应配置。
+          2. 模型名称含显式 provider 前缀（如 "openrouter/..."），精确匹配前缀。
+          3. 按注册表关键词匹配（keywords），顺序遵循 PROVIDERS 注册顺序。
+          4. 兜底：按注册顺序返回第一个配置了 api_key 的非 OAuth provider。
+        """
         from nanobot.providers.registry import PROVIDERS
 
         forced = self.agents.defaults.provider
         if forced != "auto":
+            # 用户在配置中强制指定了 provider，直接取对应配置
             p = getattr(self.providers, forced, None)
             return (p, forced) if p else (None, None)
 
+        # 统一转小写，并将连字符规范化为下划线，方便后续比较
         model_lower = (model or self.agents.defaults.model).lower()
         model_normalized = model_lower.replace("-", "_")
+        # 提取模型名中的 provider 前缀（如 "openrouter/gpt-4" → "openrouter"）
         model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
         normalized_prefix = model_prefix.replace("-", "_")
 
         def _kw_matches(kw: str) -> bool:
+            """判断关键词是否出现在模型名中（同时匹配原始形式和下划线规范化形式）。"""
             kw = kw.lower()
             return kw in model_lower or kw.replace("-", "_") in model_normalized
 
         # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
+        # 第一轮：显式前缀精确匹配，防止如 `github-copilot/...codex` 误匹配 openai_codex
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and model_prefix and normalized_prefix == spec.name:
@@ -193,6 +206,7 @@ class Config(BaseSettings):
                     return p, spec.name
 
         # Match by keyword (order follows PROVIDERS registry)
+        # 第二轮：按注册表关键词匹配（顺序遵循 PROVIDERS 注册顺序）
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and any(_kw_matches(kw) for kw in spec.keywords):

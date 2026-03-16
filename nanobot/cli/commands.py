@@ -362,6 +362,7 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 
     config_path = None
     if config:
+        # 将用户输入的任意形式路径（相对路径、含 ~ 的路径）统一规范化为一个绝对路径
         config_path = Path(config).expanduser().resolve()
         if not config_path.exists():
             console.print(f"[red]Error: Config file not found: {config_path}[/red]")
@@ -446,21 +447,50 @@ def gateway(
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
+        """定时任务触发时的回调函数，由 CronService._execute_job 调用。
+
+        负责将一个到期的 CronJob 交给 Agent 执行，并按需将结果推送给用户。
+        """
         from nanobot.agent.tools.cron import CronTool
         from nanobot.agent.tools.message import MessageTool
+
         from nanobot.utils.evaluator import evaluate_response
 
+        # 构造发给 Agent 的提示消息：告知 Agent 是哪个任务触发了、以及任务的具体指令
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
             f"Task '{job.name}' has been triggered.\n"
             f"Scheduled instruction: {job.payload.message}"
         )
 
+        # Prevent the agent from scheduling new cron jobs during execution
+        # 在执行定时任务期间，临时禁止 Agent 再创建新的定时任务。
+        # 原因：Agent 执行任务时可能会调用 cron 工具，若不加限制会导致嵌套调度。
+        # set_cron_context 返回一个 token，用于后续精确还原上下文（支持嵌套调用场景）。
+        """
+        定时任务到期 完整调用链：
+        → CronService._execute_job(job)
+            → on_cron_job(job)          ← 回调
+            → agent.process_direct()  ← Agent 开始执行
+                → LLM 生成回复
+                → Agent 调用 cron 工具（action="add"）  ← ⚠️ 问题在这里
+                    → CronTool.execute()
+                    → self._cron.add_job()  ← 又创建了一个新任务！
+        例如，用户设置了一个每天早上 9 点的任务："每天提醒我喝水"。
+            任务触发后，Agent 执行时 LLM 可能理解为"我需要再次安排明天的提醒"，于是调用 cron add 创建了一个新任务。
+            第二天又触发，又创建……任务数量指数级增长。
+        
+        set_cron_context(True)之后，nanobot/agent/tools/cron.py的execute中若为add，判断
+        _in_cron_context 为 True 时，add 操作直接返回错误，阻止 Agent 在任务执行期间创建新任务
+        """
         cron_tool = agent.tools.get("cron")
         cron_token = None
+        # 确保工具存在且是正确类型再操作，怕set_cron_context报错
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
         try:
+            # 让 Agent 处理这条提示消息，每个任务使用独立的 session（cron:{job.id}），
+            # 避免不同定时任务之间的对话历史互相干扰。
             response = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
@@ -468,13 +498,18 @@ def gateway(
                 chat_id=job.payload.to or "direct",
             )
         finally:
+            # 无论执行成功还是异常，都必须还原 cron 上下文，防止标志位泄漏
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
 
+        # 如果 Agent 在本轮执行中已经主动调用了 message 工具发送过消息，
+        # 则说明消息已经投递出去了，无需再重复推送，直接返回。
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
             return response
 
+        # 若任务配置了 deliver=True 且指定了接收方（to），
+        # 则将 Agent 的回复通过消息总线推送到对应的 channel/chat（如 Telegram、WhatsApp 等）。
         if job.payload.deliver and job.payload.to and response:
             should_notify = await evaluate_response(
                 response, job.payload.message, provider, agent.model,
@@ -490,29 +525,54 @@ def gateway(
     cron.on_job = on_cron_job
 
     # Create channel manager
+    # 初始化channels，比如说 telegram
     channels = ChannelManager(config, bus)
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
+        """为心跳触发的消息选取一个可路由的 (channel, chat_id) 目标。
+
+        遍历 session 历史（按最近活跃排序），找到第一个满足以下条件的会话：
+        - 不是内部会话（排除 cli / system）
+        - 所属 channel 当前已启用
+        以便将心跳产生的消息推送给真实用户（如 Telegram、WhatsApp 等）。这里更好的方式，是记录channel并推到对应的channel
+        若找不到合适的外部会话，则回退到 ('cli', 'direct')，
+        调用方需自行判断是否跳过推送（见 on_heartbeat_notify）。
+        """
+        # 取当前已启用的 channel 集合，用于快速判断某个 channel 是否可用
         enabled = set(channels.enabled_channels)
         # Prefer the most recently updated non-internal session on an enabled channel.
+        # list_sessions() 按最近活跃时间倒序返回，优先取最新活跃的外部会话
         for item in session_manager.list_sessions():
             key = item.get("key") or ""
+            # session key 格式为 "channel:chat_id"，跳过格式不符的
             if ":" not in key:
                 continue
             channel, chat_id = key.split(":", 1)
+            # 排除内部会话（cli 是本地终端，system 是系统内部）
             if channel in {"cli", "system"}:
                 continue
+            # 找到第一个已启用且有效的外部 channel 会话，直接返回
             if channel in enabled and chat_id:
                 return channel, chat_id
         # Fallback keeps prior behavior but remains explicit.
+        # 没有找到合适的外部会话，回退到本地终端（调用方会跳过实际推送）
         return "cli", "direct"
 
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
+        """心跳第二阶段：将心跳任务交给完整的 Agent 循环执行。
+
+        HeartbeatService 在第一阶段（由 LLM 判断）确认有需要执行的任务后，
+        会调用此函数，将任务描述字符串传入 Agent 处理。
+        使用独立的 'heartbeat' 会话，避免与用户对话历史混淆；
+        传入空进度回调（_silent）以屏蔽进度输出，防止心跳执行过程中的
+        中间状态消息干扰用户界面，最终只推送完整结果。
+        """
         channel, chat_id = _pick_heartbeat_target()
 
+        # 空进度回调：屏蔽 Agent 执行过程中的中间进度消息，避免打扰用户
         async def _silent(*_args, **_kwargs):
             pass
 
@@ -526,8 +586,16 @@ def gateway(
 
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
+        """将心跳任务的执行结果推送给用户所在的 channel。
+
+        若当前没有可用的外部 channel（_pick_heartbeat_target 回退到了 'cli'），
+        则跳过推送，避免将消息发送到无人监听的本地终端。
+        否则将 Agent 的回复封装为 OutboundMessage 发布到消息总线，
+        由对应的 channel 适配器（如 Telegram、WhatsApp 等）负责最终投递。
+        """
         from nanobot.bus.events import OutboundMessage
         channel, chat_id = _pick_heartbeat_target()
+        # 回退到 cli 说明没有可用的外部 channel，无需推送
         if channel == "cli":
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
@@ -558,6 +626,8 @@ def gateway(
         try:
             await cron.start()
             await heartbeat.start()
+            # 同时启动 agent.run()和 channels.start_all()两个异步函数
+            # await会等待两个任务都完成后才继续执行后续代码，返回一个包含两个任务结果的元组（结果不需要可忽略）
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),

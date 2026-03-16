@@ -68,10 +68,22 @@ class Session:
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary."""
+        """
+        返回供 LLM 使用的"未归档"消息列表，并做以下两项对齐处理：
+        1. 截断：只保留最近 max_messages 条，防止单次传入过多历史。
+        2. 对齐到用户轮次：丢弃开头的非 user 消息，确保第一条消息是 user 角色，
+           避免出现孤立的 tool_result 块（LLM 无法理解没有对应 tool_call 的 tool_result）。
+
+        注意：本方法只做只读裁剪，不修改 self.messages，符合 append-only 设计原则。
+        """
+        # 只取 last_consolidated 之后的消息发给 LLM，之前的消息已经被"摘要化"写入 MEMORY.md / HISTORY.md 文件，不再重复传入上下文，避免 token 爆炸。
         unconsolidated = self.messages[self.last_consolidated:]
+        # 从尾部截取最多 max_messages 条，限制单次传入 LLM 的消息数量上限
+        # 当max_messages=0，则返回全部未归档消息，不做任何截断
         sliced = unconsolidated[-max_messages:]
 
         # Drop leading non-user messages to avoid starting mid-turn when possible.
+        # 从头部找到第一条 user 消息，丢弃其之前的所有消息（如孤立的 assistant/tool 消息）
         for i, message in enumerate(sliced):
             if message.get("role") == "user":
                 sliced = sliced[i:]
@@ -83,9 +95,12 @@ class Session:
         if start:
             sliced = sliced[start:]
 
+        # 将内部存储格式（含 timestamp 等额外字段）转换为 LLM 标准输入格式
         out: list[dict[str, Any]] = []
         for message in sliced:
+            # 基础字段：role + content（content 缺失时用空字符串兜底）
             entry: dict[str, Any] = {"role": message["role"], "content": message.get("content", "")}
+            # 按需透传工具调用相关字段
             for key in ("tool_calls", "tool_call_id", "name"):
                 if key in message:
                     entry[key] = message[key]
